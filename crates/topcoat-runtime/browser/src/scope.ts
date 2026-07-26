@@ -6,16 +6,17 @@ import {
 	untrack,
 } from "@maverick-js/signals";
 
-import type {
-	ReactiveScopeId,
-	ReactiveScopeTransport,
-} from "./comment";
+import type { ReactiveScopeId, ReactiveScopeTransport } from "./comment";
 import type { Context } from "./context";
 import type { Runtime } from "./runtime";
 import { scan } from "./scan";
 import type { SignalId } from "./signal";
 
 type Compute = (cx: Context) => unknown;
+
+const WEBSOCKET_NORMAL_CLOSE_CODE = 1000;
+const WEBSOCKET_RECONNECT_BASE_DELAY_MS = 250;
+const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 
 /**
  * A region of the DOM that owns disposable reactive resources (effects and
@@ -82,6 +83,8 @@ export class ReactiveScope extends Scope {
 	private readonly computes: Compute[];
 	private abortController: AbortController | null = null;
 	private socket: WebSocket | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private reconnectAttempt = 0;
 	private flushPending = false;
 
 	constructor(
@@ -139,6 +142,11 @@ export class ReactiveScope extends Scope {
 
 		this.abortController?.abort();
 		this.abortController = null;
+
+		if (this.reconnectTimer !== null) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
 
 		const socket = this.socket;
 		this.socket = null;
@@ -224,11 +232,38 @@ export class ReactiveScope extends Scope {
 			) {
 				return;
 			}
+			this.reconnectAttempt = 0;
 			this.replaceContent(event.data);
 		};
-		socket.onclose = () => {
-			if (this.socket === socket) this.socket = null;
+		socket.onclose = (event) => {
+			if (this.socket !== socket) return;
+			this.socket = null;
+			if (event.code !== WEBSOCKET_NORMAL_CLOSE_CODE || !event.wasClean) {
+				this.scheduleWebSocketReconnect();
+			}
 		};
+	}
+
+	private scheduleWebSocketReconnect(): void {
+		if (
+			this.isDisposed ||
+			this.socket !== null ||
+			this.reconnectTimer !== null
+		) {
+			return;
+		}
+
+		const delay = Math.min(
+			WEBSOCKET_RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt,
+			WEBSOCKET_RECONNECT_MAX_DELAY_MS,
+		);
+		if (delay < WEBSOCKET_RECONNECT_MAX_DELAY_MS) {
+			this.reconnectAttempt += 1;
+		}
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			if (!this.isDisposed && this.socket === null) this.openWebSocket();
+		}, delay);
 	}
 
 	private scheduleWebSocketSend(): void {

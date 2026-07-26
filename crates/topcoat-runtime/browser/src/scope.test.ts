@@ -1,4 +1,4 @@
-import { beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { Runtime } from "./runtime";
 import { ReactiveScope } from "./scope";
@@ -42,15 +42,15 @@ class MockWebSocket {
 		this.onmessage?.(new MessageEvent("message", { data: value }));
 	}
 
-	close(): void {
+	close(code = 1000): void {
 		this.closeCalls += 1;
 		this.readyState = MockWebSocket.CLOSED;
-		this.onclose?.(new CloseEvent("close"));
+		this.onclose?.(new CloseEvent("close", { code, wasClean: code === 1000 }));
 	}
 
 	unexpectedClose(): void {
 		this.readyState = MockWebSocket.CLOSED;
-		this.onclose?.(new CloseEvent("close"));
+		this.onclose?.(new CloseEvent("close", { code: 1006, wasClean: false }));
 	}
 }
 
@@ -117,7 +117,16 @@ Object.defineProperty(globalThis, "MessageEvent", {
 Object.defineProperty(globalThis, "CloseEvent", {
 	configurable: true,
 	value: class CloseEvent {
-		constructor(readonly type: string) {}
+		readonly code: number;
+		readonly wasClean: boolean;
+
+		constructor(
+			readonly type: string,
+			init: { code?: number; wasClean?: boolean } = {},
+		) {
+			this.code = init.code ?? 0;
+			this.wasClean = init.wasClean ?? false;
+		}
 	},
 });
 
@@ -126,7 +135,11 @@ beforeEach(() => {
 	insertedHtml.length = 0;
 });
 
-it("streams arguments and replaces content until disposal", async () => {
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+function createWebSocketScope(): { runtime: Runtime; scope: ReactiveScope } {
 	const runtime = new Runtime();
 	runtime.registry.insert("query", new RuntimeString("first"));
 	const scope = new ReactiveScope(
@@ -140,7 +153,11 @@ it("streams arguments and replaces content until disposal", async () => {
 	);
 	scope.attachEnd(end);
 	scope.startWatching();
+	return { runtime, scope };
+}
 
+it("streams arguments and replaces content until disposal", async () => {
+	const { runtime, scope } = createWebSocketScope();
 	const socket = MockWebSocket.instances[0];
 	expect(socket).toBeDefined();
 	expect(socket?.url).toBe("ws://example.test/_topcoat/shards/id");
@@ -168,22 +185,51 @@ it("streams arguments and replaces content until disposal", async () => {
 	expect(socket?.sent).toEqual(['["first"]', '["third"]']);
 });
 
-it("does not reconnect after an unexpected close", () => {
-	const runtime = new Runtime();
-	runtime.registry.insert("query", new RuntimeString("first"));
-	const scope = new ReactiveScope(
-		runtime.rootScope,
-		runtime,
-		"scope-id",
-		"/_topcoat/shards/id",
-		"ws",
-		['cx.signal("query").get()'],
-		start,
-	);
-	scope.attachEnd(end);
-	scope.startWatching();
+it("reconnects unexpected closes with bounded backoff and current state", () => {
+	vi.useFakeTimers();
+	const { runtime, scope } = createWebSocketScope();
+	let socket = MockWebSocket.instances[0];
+	socket?.open();
+	socket?.message("<p>hydrated</p>");
+	expect(socket?.sent).toEqual(['["first"]']);
 
-	MockWebSocket.instances[0]?.unexpectedClose();
+	socket?.unexpectedClose();
+	vi.advanceTimersByTime(249);
 	expect(MockWebSocket.instances).toHaveLength(1);
+
+	const query = runtime.registry.handle("query");
+	query.set(new RuntimeString("while disconnected"));
+	vi.advanceTimersByTime(1);
+	expect(MockWebSocket.instances).toHaveLength(2);
+	socket = MockWebSocket.instances[1];
+	socket?.open();
+	expect(socket?.sent).toEqual(['["while disconnected"]']);
+
+	for (const delay of [500, 1000, 2000, 4000, 8000, 10_000, 10_000]) {
+		socket?.unexpectedClose();
+		const count = MockWebSocket.instances.length;
+		vi.advanceTimersByTime(delay - 1);
+		expect(MockWebSocket.instances).toHaveLength(count);
+		vi.advanceTimersByTime(1);
+		expect(MockWebSocket.instances).toHaveLength(count + 1);
+		socket = MockWebSocket.instances.at(-1);
+	}
+
 	scope.dispose();
+});
+
+it("does not reconnect normal closes or disposed scopes", () => {
+	vi.useFakeTimers();
+	const normal = createWebSocketScope();
+	MockWebSocket.instances[0]?.close(1000);
+	vi.advanceTimersByTime(20_000);
+	expect(MockWebSocket.instances).toHaveLength(1);
+	normal.scope.dispose();
+
+	MockWebSocket.instances = [];
+	const unexpected = createWebSocketScope();
+	MockWebSocket.instances[0]?.unexpectedClose();
+	unexpected.scope.dispose();
+	vi.advanceTimersByTime(20_000);
+	expect(MockWebSocket.instances).toHaveLength(1);
 });

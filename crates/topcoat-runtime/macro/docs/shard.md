@@ -68,7 +68,9 @@ async fn search_results(
 # async fn search_products(_cx: &Cx, _query: &str) -> Vec<String> { vec![] }
 ```
 
-The browser sends the current argument when the socket opens and sends later values when the expression changes. Same-tick changes coalesce. Every successful stream item replaces the shard content, so the stream may also push renders without a new browser value. The input channel has capacity one. The socket closes when the stream errors or completes, the client disconnects, or the scope is disposed. An unexpected close is not reconnected automatically.
+The browser sends the current argument when the socket opens and sends later values when the expression changes. Same-tick changes coalesce. Every successful stream item replaces the shard content, so the stream may also push renders without a new browser value. The input channel has capacity one. The socket closes when the stream errors or completes, the client disconnects, or the scope is disposed.
+
+An unexpectedly closed socket reconnects with exponential backoff capped at 10 seconds. A new connection sends the current argument, which lets the stream resynchronize authoritative state. A normal close or disposed scope does not reconnect.
 
 Server-side rendering and the hydrated connection are separate invocations. During server-side rendering, Topcoat creates a temporary capacity-one channel, seeds it with the initial `Arg`, drops its sender, invokes the shard, and uses the first stream item as the placeholder. During hydration, the browser opens a new persistent socket, Topcoat invokes the shard again, and the browser resends the current `Arg`. Code must not rely on state from the server-side invocation surviving into the socket invocation.
 
